@@ -562,6 +562,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
 
         if (round.totalWin > 0) {
             IERC20(round.paymentToken).safeTransfer(game.treasury, round.totalWin);
+            round.totalWin = 0;
         }
         
         // Allow finalization even if not all prizes distributed
