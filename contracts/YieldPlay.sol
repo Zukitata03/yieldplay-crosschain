@@ -314,11 +314,14 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         if (round.status != RoundStatus.InProgress) revert Errors.RoundNotActive();
         
         // Transfer tokens from user
+        uint256 preBalance = IERC20(round.paymentToken).balanceOf(address(this));
         IERC20(round.paymentToken).safeTransferFrom(msg.sender, address(this), amount);
+        uint256 postBalance = IERC20(round.paymentToken).balanceOf(address(this));
+        uint256 actualAmount = postBalance - preBalance;
         
         // Calculate deposit fee (goes to bonus prize pool)
-        uint256 depositFee = (amount * round.depositFeeBps) / BPS_DENOMINATOR;
-        uint256 netDeposit = amount - depositFee;
+        uint256 depositFee = (actualAmount * round.depositFeeBps) / BPS_DENOMINATOR;
+        uint256 netDeposit = actualAmount - depositFee;
         
         // Update round state
         round.totalDeposit += netDeposit;
