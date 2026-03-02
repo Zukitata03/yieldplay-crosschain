@@ -59,8 +59,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         bytes32 indexed gameId,
         address indexed owner,
         string gameName,
-        uint16 devFeeBps,
-        address paymentToken
+        uint16 devFeeBps
     );
     
     event RoundCreated(
@@ -69,7 +68,9 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         uint64 startTs,
         uint64 endTs,
         uint64 lockTime,
-        uint16 depositFeeBps
+        uint16 depositFeeBps,
+        address paymentToken,
+        address vault
     );
     
     event Deposited(
@@ -180,17 +181,14 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
      * @param gameName Unique name for the game
      * @param devFeeBps Developer fee in basis points (max 10000)
      * @param treasury Address to receive developer fees
-     * @param paymentToken ERC20 token accepted for deposits
      * @return gameId The unique identifier for the created game
      */
     function createGame(
         string calldata gameName,
         uint16 devFeeBps,
-        address treasury,
-        address paymentToken
+        address treasury
     ) external whenNotPaused returns (bytes32 gameId) {
         if (devFeeBps > BPS_DENOMINATOR) revert Errors.InvalidDevFeeBps();
-        if (paymentToken == address(0)) revert Errors.InvalidPaymentToken();
         if (treasury == address(0)) revert Errors.ZeroAddress();
         
         gameId = keccak256(abi.encodePacked(msg.sender, gameName));
@@ -203,11 +201,10 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
             devFeeBps: devFeeBps,
             treasury: treasury,
             roundCounter: 0,
-            paymentToken: paymentToken,
             initialized: true
         });
         
-        emit GameCreated(gameId, msg.sender, gameName, devFeeBps, paymentToken);
+        emit GameCreated(gameId, msg.sender, gameName, devFeeBps);
     }
 
     // ============ Round Management ============
@@ -218,6 +215,8 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
      * @param startTs Round start timestamp
      * @param endTs Round end timestamp (deposits close)
      * @param lockTime Additional lock period in seconds
+     * @param depositFeeBps Deposit fee in basis points
+     * @param paymentToken ERC20 token accepted for deposits in this round
      * @return roundId The created round's ID
      */
     function createRound(
@@ -225,7 +224,8 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         uint64 startTs,
         uint64 endTs,
         uint64 lockTime,
-        uint16 depositFeeBps
+        uint16 depositFeeBps,
+        address paymentToken
     ) external whenNotPaused returns (uint256 roundId) {
         Game storage game = games[gameId];
         
@@ -233,6 +233,10 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         if (msg.sender != game.owner) revert Errors.Unauthorized();
         if (endTs <= startTs) revert Errors.InvalidRoundTime();
         if (depositFeeBps > 1000) revert Errors.InvalidDevFeeBps(); // Max 10% deposit fee
+        if (paymentToken == address(0)) revert Errors.InvalidPaymentToken();
+        
+        address vault = vaults[paymentToken];
+        if (vault == address(0)) revert Errors.StrategyNotSet();
         
         roundId = game.roundCounter;
         
@@ -244,6 +248,8 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
             devFee: 0,
             totalWin: 0,
             yieldAmount: 0,
+            paymentToken: paymentToken,
+            vault: vault,
             depositFeeBps: depositFeeBps,
             startTs: startTs,
             endTs: endTs,
@@ -256,7 +262,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         
         game.roundCounter++;
         
-        emit RoundCreated(gameId, roundId, startTs, endTs, lockTime, depositFeeBps);
+        emit RoundCreated(gameId, roundId, startTs, endTs, lockTime, depositFeeBps, paymentToken, vault);
     }
     
     /**
@@ -308,7 +314,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         if (round.status != RoundStatus.InProgress) revert Errors.RoundNotActive();
         
         // Transfer tokens from user
-        IERC20(game.paymentToken).safeTransferFrom(msg.sender, address(this), amount);
+        IERC20(round.paymentToken).safeTransferFrom(msg.sender, address(this), amount);
         
         // Calculate deposit fee (goes to bonus prize pool)
         uint256 depositFee = (amount * round.depositFeeBps) / BPS_DENOMINATOR;
@@ -335,7 +341,6 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         bytes32 gameId,
         uint256 roundId
     ) external nonReentrant whenNotPaused {
-        Game storage game = games[gameId];
         Round storage round = rounds[gameId][roundId];
         UserDeposit storage userDep = userDeposits[gameId][roundId][msg.sender];
         
@@ -352,7 +357,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         userDep.isClaimed = true;
         
         if (totalAmount > 0) {
-            IERC20(game.paymentToken).safeTransfer(msg.sender, totalAmount);
+            IERC20(round.paymentToken).safeTransfer(msg.sender, totalAmount);
         }
         
         emit Claimed(gameId, roundId, msg.sender, userDep.depositAmount, userDep.amountToClaim);
@@ -384,9 +389,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         }
         
         if (round.totalDeposit == 0) revert Errors.InvalidAmount();
-        
-        address vault = vaults[game.paymentToken];
-        if (vault == address(0)) revert Errors.StrategyNotSet();
+        if (round.vault == address(0)) revert Errors.StrategyNotSet();
         
         // Only deploy the portion that hasn't been deployed yet
         uint256 totalFunds = round.totalDeposit + round.bonusPrizePool;
@@ -396,8 +399,8 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         if (amount == 0) revert Errors.InvalidAmount();
         
         // Approve vault and deposit
-        IERC20(game.paymentToken).safeIncreaseAllowance(vault, amount);
-        uint256 shares = IERC4626(vault).deposit(amount, address(this));
+        IERC20(round.paymentToken).safeIncreaseAllowance(round.vault, amount);
+        uint256 shares = IERC4626(round.vault).deposit(amount, address(this));
         
         deployedAmounts[gameId][roundId] += amount;
         deployedShares[gameId][roundId] += shares;
@@ -428,14 +431,12 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         
         uint256 shares = deployedShares[gameId][roundId];
         if (shares == 0) revert Errors.FundsNotDeployed();
-        
-        address vault = vaults[game.paymentToken];
-        if (vault == address(0)) revert Errors.StrategyNotSet();
+        if (round.vault == address(0)) revert Errors.StrategyNotSet();
         
         uint256 principal = deployedAmounts[gameId][roundId];
         
         // Redeem all shares for underlying assets
-        uint256 withdrawn = IERC4626(vault).redeem(shares, address(this), address(this));
+        uint256 withdrawn = IERC4626(round.vault).redeem(shares, address(this), address(this));
         
         uint256 yieldAmount = withdrawn > principal ? withdrawn - principal : 0;
         
@@ -486,10 +487,10 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
             
             // Transfer fees
             if (performanceFee > 0) {
-                IERC20(game.paymentToken).safeTransfer(protocolTreasury, performanceFee);
+                IERC20(round.paymentToken).safeTransfer(protocolTreasury, performanceFee);
             }
             if (devFee > 0) {
-                IERC20(game.paymentToken).safeTransfer(game.treasury, devFee);
+                IERC20(round.paymentToken).safeTransfer(game.treasury, devFee);
             }
         }
         
@@ -560,7 +561,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         if (!round.isSettled) revert Errors.RoundNotSettled();
 
         if (round.totalWin > 0) {
-            IERC20(game.paymentToken).safeTransfer(game.treasury, round.totalWin);
+            IERC20(round.paymentToken).safeTransfer(game.treasury, round.totalWin);
         }
         
         // Allow finalization even if not all prizes distributed

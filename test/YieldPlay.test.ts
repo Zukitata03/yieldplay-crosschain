@@ -98,13 +98,22 @@ describe("YieldPlay – Avalanche mainnet fork (Euler eUSDC-19)", function () {
     const endTs   = now + 86_400n;       // 1 day deposit window
     const lockTime = 7n * 86_400n;       // 7-day lock → yield accrues in vault
 
+
+    gameId = await yieldPlay
+      .connect(gameOwner)
+      .createGame
+      .staticCall(
+        "ForkTestGame",
+        500,           // 5% dev fee
+        gameOwner.address
+      );
+
     const tx = await yieldPlay
       .connect(gameOwner)
       .createGame(
         "ForkTestGame",
         500,           // 5% dev fee
-        gameOwner.address,
-        USDC_ADDRESS
+        gameOwner.address
       );
     const receipt = await tx.wait();
 
@@ -113,17 +122,17 @@ describe("YieldPlay – Avalanche mainnet fork (Euler eUSDC-19)", function () {
       ["address", "string"],
       [gameOwner.address, "ForkTestGame"]
     );
-
+    
     roundId = await yieldPlay
       .connect(gameOwner)
-      .createRound.staticCall(gameId, startTs, endTs, lockTime, 100); // 1% deposit fee
+      .createRound.staticCall(gameId, startTs, endTs, lockTime, 100, USDC_ADDRESS); // 1% deposit fee
 
-    await yieldPlay.connect(gameOwner).createRound(gameId, startTs, endTs, lockTime, 100);
+    await yieldPlay.connect(gameOwner).createRound(gameId, startTs, endTs, lockTime, 100, USDC_ADDRESS);
 
     const game  = await yieldPlay.getGame(gameId);
     const round = await yieldPlay.getRound(gameId, roundId);
 
-    expect(game.paymentToken).to.equal(USDC_ADDRESS);
+    expect(round.paymentToken).to.equal(USDC_ADDRESS);
     expect(round.startTs).to.equal(startTs);
     console.log(`  gameId : ${gameId}`);
     console.log(`  roundId: ${roundId}`);
@@ -209,6 +218,8 @@ describe("YieldPlay – Avalanche mainnet fork (Euler eUSDC-19)", function () {
     await yieldPlay.connect(gameOwner).settlement(gameId, roundId);
 
     const round = await yieldPlay.getRound(gameId, roundId);
+    console.log(`  bonusPrizePool: ${ethers.formatUnits(round.bonusPrizePool, 6)} USDC`);
+    console.log(`  yieldAmount: ${ethers.formatUnits(round.yieldAmount, 6)} USDC`);
     console.log(`  totalWin (prize pool): ${ethers.formatUnits(round.totalWin, 6)} USDC`);
     expect(round.isSettled).to.be.true;
 
@@ -267,8 +278,8 @@ describe("YieldPlay – Avalanche mainnet fork (Euler eUSDC-19)", function () {
 
       const roundId2 = await yieldPlay
         .connect(gameOwner)
-        .createRound.staticCall(gameId, startTs2, endTs2, lockTime2, 100); // 1% deposit fee
-      await yieldPlay.connect(gameOwner).createRound(gameId, startTs2, endTs2, lockTime2, 100);
+        .createRound.staticCall(gameId, startTs2, endTs2, lockTime2, 100, USDC_ADDRESS); // 1% deposit fee
+      await yieldPlay.connect(gameOwner).createRound(gameId, startTs2, endTs2, lockTime2, 100, USDC_ADDRESS);
 
       // ── Users deposit into round2 ─────────────────────────────────────
       await time.increaseTo(Number(startTs2) + 1);
