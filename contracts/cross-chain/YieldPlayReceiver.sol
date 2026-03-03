@@ -5,6 +5,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ITeleporterReceiver} from "../interfaces/ITeleporterReceiver.sol";
+import {ITeleporterMessenger, TeleporterMessageInput, TeleporterFeeInfo} from "../interfaces/ITeleporterMessenger.sol";
 
 /**
  * @notice Minimal interface for calling depositOnBehalf on YieldPlay
@@ -16,6 +17,12 @@ interface IYieldPlayDeposit {
         address user,
         uint256 amount
     ) external;
+
+    function claimOnBehalf(
+        bytes32 gameId,
+        uint256 roundId,
+        address user
+    ) external returns (uint256 totalAmount);
 }
 
 /**
@@ -39,6 +46,13 @@ contract YieldPlayReceiver is ITeleporterReceiver, Ownable {
     address public constant TELEPORTER_MESSENGER =
         0x253b2784c75e510dD0fF1da844684a1aC0aa5fcf;
 
+    /// @notice Gas limit for execution on the destination chain
+    uint256 public constant DEST_GAS_LIMIT = 300_000;
+
+    // ─── Enums ────────────────────────────────────────────────────────────────
+
+    enum MessageType { DEPOSIT, CLAIM_REQUEST, CLAIM_RESULT, REFUND }
+
     // ─── Immutables ───────────────────────────────────────────────────────────
 
     /// @notice Main YieldPlay contract on this chain
@@ -56,6 +70,22 @@ contract YieldPlayReceiver is ITeleporterReceiver, Ownable {
 
     event CrossChainDepositReceived(
         bytes32 indexed sourceChainId,
+        bytes32 indexed gameId,
+        uint256 indexed roundId,
+        address user,
+        uint256 amount
+    );
+
+    event CrossChainRefundSent(
+        bytes32 indexed destChainId,
+        bytes32 indexed gameId,
+        uint256 indexed roundId,
+        address user,
+        uint256 amount
+    );
+
+    event CrossChainClaimProcessed(
+        bytes32 indexed destChainId,
         bytes32 indexed gameId,
         uint256 indexed roundId,
         address user,
@@ -119,15 +149,48 @@ contract YieldPlayReceiver is ITeleporterReceiver, Ownable {
             revert UntrustedSource(sourceBlockchainID, originSenderAddress);
         }
 
-        // 3. Decode payload
-        (bytes32 gameId, uint256 roundId, address user, uint256 amount) =
-            abi.decode(message, (bytes32, uint256, address, uint256));
+        // 3. Decode payload type
+        MessageType messageType = abi.decode(message, (MessageType));
 
-        // 4. Approve YieldPlay to pull funds from this contract, then deposit
-        IERC20(paymentToken).safeIncreaseAllowance(address(yieldPlay), amount);
-        yieldPlay.depositOnBehalf(gameId, roundId, user, amount);
+        if (messageType == MessageType.DEPOSIT) {
+            (, bytes32 gameId, uint256 roundId, address user, uint256 amount) =
+                abi.decode(message, (MessageType, bytes32, uint256, address, uint256));
 
-        emit CrossChainDepositReceived(sourceBlockchainID, gameId, roundId, user, amount);
+            // 4. Approve YieldPlay to pull funds from this contract, then deposit
+            IERC20(paymentToken).safeIncreaseAllowance(address(yieldPlay), amount);
+            
+            try yieldPlay.depositOnBehalf(gameId, roundId, user, amount) {
+                emit CrossChainDepositReceived(sourceBlockchainID, gameId, roundId, user, amount);
+            } catch {
+                // Deposit failed (e.g. round expired). Send refund message back.
+                IERC20(paymentToken).safeDecreaseAllowance(address(yieldPlay), amount);
+                bytes memory refundPayload = abi.encode(MessageType.REFUND, gameId, roundId, user, amount);
+                _sendTeleporterMessage(sourceBlockchainID, expectedSender, refundPayload);
+                emit CrossChainRefundSent(sourceBlockchainID, gameId, roundId, user, amount);
+            }
+        } else if (messageType == MessageType.CLAIM_REQUEST) {
+            (, bytes32 gameId, uint256 roundId, address user) =
+                abi.decode(message, (MessageType, bytes32, uint256, address));
+            
+            // Assuming claimOnBehalf sends funds to THIS receiver contract
+            uint256 claimedAmount = yieldPlay.claimOnBehalf(gameId, roundId, user);
+            
+            bytes memory claimPayload = abi.encode(MessageType.CLAIM_RESULT, gameId, roundId, user, claimedAmount);
+            _sendTeleporterMessage(sourceBlockchainID, expectedSender, claimPayload);
+            emit CrossChainClaimProcessed(sourceBlockchainID, gameId, roundId, user, claimedAmount);
+        }
+    }
+
+    function _sendTeleporterMessage(bytes32 destinationBlockchainID, address destinationAddress, bytes memory payload) internal {
+        TeleporterMessageInput memory messageInput = TeleporterMessageInput({
+            destinationBlockchainID: destinationBlockchainID,
+            destinationAddress: destinationAddress,
+            feeInfo: TeleporterFeeInfo({feeTokenAddress: address(0), amount: 0}),
+            requiredGasLimit: DEST_GAS_LIMIT,
+            allowedRelayerAddresses: new address[](0),
+            message: payload
+        });
+        ITeleporterMessenger(TELEPORTER_MESSENGER).sendCrossChainMessage(messageInput);
     }
 
     // ─── Fund Management ─────────────────────────────────────────────────────

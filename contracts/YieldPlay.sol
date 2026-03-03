@@ -212,6 +212,9 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         updateRoundStatus(gameId, roundId);
         if (round.status != RoundStatus.InProgress) revert Errors.RoundNotActive();
 
+        // Pull tokens from Receiver into YieldPlay 
+        IERC20(round.paymentToken).safeTransferFrom(msg.sender, address(this), amount);
+
         // Calculate deposit fee (goes to bonus prize pool)
         uint256 depositFee = (amount * round.depositFeeBps) / BPS_DENOMINATOR;
         uint256 netDeposit = amount - depositFee;
@@ -417,6 +420,43 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         }
         
         emit Claimed(gameId, roundId, msg.sender, userDep.depositAmount, userDep.amountToClaim);
+    }
+
+    /**
+     * @notice Cross-chain claims for users from another chain
+     * @param gameId The game identifier
+     * @param roundId The round identifier
+     * @param user The original depositor's address
+     * @return totalAmount The amount claimed and transferred
+     */
+    function claimOnBehalf(
+        bytes32 gameId,
+        uint256 roundId,
+        address user
+    ) external nonReentrant whenNotPaused returns (uint256 totalAmount) {
+        if (msg.sender != crossChainReceiver) revert Errors.UnauthorizedCrossChainCaller();
+
+        Round storage round = rounds[gameId][roundId];
+        UserDeposit storage userDep = userDeposits[gameId][roundId][user];
+        
+        if (round.status != RoundStatus.DistributingRewards) {
+            revert Errors.RoundNotCompleted();
+        }
+        if (userDep.isClaimed) revert Errors.AlreadyClaimed();
+        if (!userDep.exists || userDep.depositAmount == 0) {
+            revert Errors.NoDepositsFound();
+        }
+        
+        totalAmount = userDep.depositAmount + userDep.amountToClaim;
+        userDep.isClaimed = true;
+        
+        if (totalAmount > 0) {
+            IERC20(round.paymentToken).safeTransfer(msg.sender, totalAmount);
+        }
+        
+        emit Claimed(gameId, roundId, user, userDep.depositAmount, userDep.amountToClaim);
+        
+        return totalAmount;
     }
 
     // ============ Game Owner Actions ============
