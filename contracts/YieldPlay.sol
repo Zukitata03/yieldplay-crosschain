@@ -400,14 +400,16 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         uint256 amount = totalFunds - alreadyDeployed;
         
         if (amount == 0) revert Errors.InvalidAmount();
+
+        deployedAmounts[gameId][roundId] += amount;
         
         // Approve vault and deposit
         IERC20(round.paymentToken).safeIncreaseAllowance(round.vault, amount);
         uint256 shares = IERC4626(round.vault).deposit(amount, address(this));
         
-        deployedAmounts[gameId][roundId] += amount;
-        deployedShares[gameId][roundId] += shares;
         
+        deployedShares[gameId][roundId] += shares;
+
         emit FundsDeployed(gameId, roundId, amount, shares);
     }
     
