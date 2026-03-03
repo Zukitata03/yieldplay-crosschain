@@ -50,8 +50,12 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
     /// @notice Mapping from gameId => roundId => deposited amount to vault
     mapping(bytes32 => mapping(uint256 => uint256)) public deployedAmounts;
     
-    /// @notice Mapping from gameId => roundId => vault shares received
+    /// @notice Mapping from gameId =\> roundId =\> vault shares received
     mapping(bytes32 => mapping(uint256 => uint256)) public deployedShares;
+
+    /// @notice Address of YieldPlayReceiver allowed to call depositOnBehalf
+    address public crossChainReceiver;
+
 
     // ============ Events ============
     
@@ -173,6 +177,55 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
     function unpause() external onlyOwner {
         _unpause();
     }
+
+    /**
+     * @notice Set the address of the trusted cross-chain receiver contract.
+     * @param _receiver Address of YieldPlayReceiver deployed on this chain
+     */
+    function setCrossChainReceiver(address _receiver) external onlyOwner {
+        crossChainReceiver = _receiver;
+    }
+
+    /**
+     * @notice Deposit on behalf of a user who initiated a cross-chain deposit.
+     * @dev Called exclusively by YieldPlayReceiver after verifying the Teleporter message.
+     *      Tokens must already be in this contract (transferred by YieldPlayReceiver).
+     * @param gameId  Target game
+     * @param roundId Target round
+     * @param user    Original depositor address on the source chain
+     * @param amount  Amount of tokens to credit (already transferred here)
+     */
+    function depositOnBehalf(
+        bytes32 gameId,
+        uint256 roundId,
+        address user,
+        uint256 amount
+    ) external nonReentrant whenNotPaused {
+        if (msg.sender != crossChainReceiver) revert Errors.UnauthorizedCrossChainCaller();
+        if (amount == 0) revert Errors.InvalidAmount();
+
+        Game storage game = games[gameId];
+        Round storage round = rounds[gameId][roundId];
+
+        if (!game.initialized) revert Errors.GameNotFound();
+
+        updateRoundStatus(gameId, roundId);
+        if (round.status != RoundStatus.InProgress) revert Errors.RoundNotActive();
+
+        // Calculate deposit fee (goes to bonus prize pool)
+        uint256 depositFee = (amount * round.depositFeeBps) / BPS_DENOMINATOR;
+        uint256 netDeposit = amount - depositFee;
+
+        round.totalDeposit += netDeposit;
+        round.bonusPrizePool += depositFee;
+
+        UserDeposit storage userDep = userDeposits[gameId][roundId][user];
+        userDep.depositAmount += netDeposit;
+        userDep.exists = true;
+
+        emit Deposited(gameId, roundId, user, netDeposit, depositFee);
+    }
+
 
     // ============ Game Management ============
     

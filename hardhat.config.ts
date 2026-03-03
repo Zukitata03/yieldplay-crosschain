@@ -48,6 +48,21 @@ const config: HardhatUserConfig = {
       accounts: [PRIVATE_KEY],
       chainId: 43114,
     },
+    fuji: {
+      url: "https://api.avax-test.network/ext/bc/C/rpc",
+      chainId: 43113,
+      accounts: process.env.MNEMONIC ? { mnemonic: process.env.MNEMONIC } : [PRIVATE_KEY],
+    },
+    chainA: {
+      url: "http://127.0.0.1:9654/ext/bc/27Kd7ibmo2HWSYG4gnoZ164hQQ8CuCgeunan7qpd3TfqRivKiy/rpc",
+      chainId: 1112,
+      accounts: ["0x56289e99c94b6912bfc12adc093c9b51124f0dc54ac7a766b2bc5ccf558d8027"],
+    },
+    chainC: {
+      url: "http://127.0.0.1:9658/ext/bc/QPbg4eCHLkjnbw6U9PgD7vzX8EEcCD8C347osKjoLmvT13MWn/rpc",
+      chainId: 11113,
+      accounts: ["0x56289e99c94b6912bfc12adc093c9b51124f0dc54ac7a766b2bc5ccf558d8027"],
+    },
   },
   etherscan: {
     apiKey: {

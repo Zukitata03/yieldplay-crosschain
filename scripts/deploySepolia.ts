@@ -8,7 +8,7 @@ import { ethers } from "hardhat";
  *    - PRIVATE_KEY=your_private_key
  *    - SEPOLIA_RPC_URL=https://ethereum-sepolia-rpc.publicnode.com
  * 
- * 2. Make sure you have Sepolia ETH for gas
+ * 2. Sepolia ETH for gas
  * 
  * Run: npx hardhat run scripts/deploySepolia.ts --network sepolia
  */
@@ -42,7 +42,7 @@ async function main() {
   } catch (error) {
     console.log("Warning: Could not read vault asset. Proceeding anyway...");
     // Default to common USDC on Sepolia
-    underlyingToken = "0x94a9D9AC8a22534E3FaCa9F4e7F2E2cf85d5E4C8"; // Circle USDC on Sepolia
+    underlyingToken = "0x94a9D9AC8a22534E3FaCa9F4e7F2E2cf85d5E4C8"; // USDC on Sepolia
   }
 
   // Deploy YieldPlay

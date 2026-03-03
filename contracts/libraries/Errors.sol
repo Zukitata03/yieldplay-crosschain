@@ -77,4 +77,7 @@ library Errors {
     
     /// @notice Thrown when winner amount exceeds available pool
     error InsufficientPrizePool();
+
+    /// @notice Thrown when depositOnBehalf is called by an untrusted address
+    error UnauthorizedCrossChainCaller();
 }

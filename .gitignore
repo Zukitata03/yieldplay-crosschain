@@ -1,10 +1,12 @@
 node_modules
 .env
+bin/
+test_output.log
 
 # Hardhat files
 /cache
 /artifacts
-
+/scripts_local
 # TypeChain files
 /typechain
 /typechain-types
