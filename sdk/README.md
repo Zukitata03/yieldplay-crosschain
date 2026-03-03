@@ -570,11 +570,113 @@ npx ts-node sdk/example.ts
 
 ## Fee Structure
 
-| Loại phí | Tỷ lệ | Mô tả |
-|----------|-------|-------|
-| Performance Fee | 20% | Phí protocol trên yield |
-| Developer Fee | 0-100% | Phí game owner trên yield (sau performance fee) |
-| Deposit Fee | 0-10% | Phí khi deposit, vào prize pool |
+### Tổng quan
+
+YieldPlay có 3 loại phí:
+
+| Loại phí | Tỷ lệ | Người nhận | Mô tả |
+|----------|-------|------------|-------|
+| **Performance Fee** | 20% cố định | Protocol Treasury | Phí protocol trên yield sinh ra |
+| **Developer Fee** | 0-100% (tùy chọn) | Game Treasury | Phí game owner trên yield (sau performance fee) |
+| **Deposit Fee** | 0-10% (tùy chọn) | Prize Pool | Phí khi user deposit, được cộng vào prize pool |
+
+### Chi tiết từng loại phí
+
+#### 1. Performance Fee (20%)
+- **Cố định**: 2000 basis points = 20%
+- **Áp dụng**: Trên tổng yield sinh ra từ vault
+- **Người nhận**: Protocol Treasury
+- **Thời điểm**: Thu khi settlement
+
+```
+Yield từ vault = 1000 USDC
+Performance Fee = 1000 * 20% = 200 USDC → Protocol Treasury
+Còn lại = 800 USDC
+```
+
+#### 2. Developer Fee (0-100%)
+- **Cài đặt**: Khi tạo game (`devFeeBps` trong `createGame()`)
+- **Áp dụng**: Trên yield sau khi trừ Performance Fee
+- **Người nhận**: Game Treasury
+
+```typescript
+// Ví dụ: devFeeBps = 500 (5%)
+await sdk.createGame({
+  gameName: "My Game",
+  devFeeBps: 500,  // 5% = 500 basis points
+  treasury: gameOwnerAddress,
+});
+```
+
+```
+Yield sau performance fee = 800 USDC
+Developer Fee = 800 * 5% = 40 USDC → Game Treasury
+Prize Pool từ yield = 760 USDC
+```
+
+#### 3. Deposit Fee (0-10%)
+- **Cài đặt**: Khi tạo round (`depositFeeBps` trong `createRound()`)
+- **Giới hạn**: Tối đa 1000 basis points = 10%
+- **Áp dụng**: Trên mỗi lần user deposit
+- **Đặc biệt**: Deposit fee được cộng vào Bonus Prize Pool, không phải phí thu
+
+```typescript
+// Ví dụ: depositFeeBps = 100 (1%)
+await sdk.createRound({
+  gameId: "0x...",
+  depositFeeBps: 100,  // 1% = 100 basis points
+  // ...
+});
+```
+
+```
+User deposit = 100 USDC
+Deposit Fee = 100 * 1% = 1 USDC → Bonus Prize Pool
+Net Deposit (user credit) = 99 USDC
+```
+
+### Ví dụ tính toán đầy đủ
+
+**Cài đặt:**
+- Performance Fee: 20% (cố định)
+- Developer Fee: 5% (devFeeBps = 500)
+- Deposit Fee: 1% (depositFeeBps = 100)
+- Total Deposits: 10,000 USDC
+- Yield từ vault: 500 USDC
+
+**Tính toán:**
+
+```
+1. Deposit Phase:
+   - User deposits: 10,000 USDC
+   - Deposit Fee (1%): 100 USDC → Bonus Prize Pool
+   - Net Deposits: 9,900 USDC
+
+2. Settlement Phase:
+   - Yield từ vault: 500 USDC
+   - Performance Fee (20%): 100 USDC → Protocol Treasury
+   - Yield sau performance: 400 USDC
+   - Developer Fee (5%): 20 USDC → Game Treasury
+   - Yield Prize: 380 USDC
+
+3. Total Prize Pool:
+   - Yield Prize: 380 USDC
+   - Bonus Prize Pool: 100 USDC
+   - Total: 480 USDC cho winners
+
+4. Users nhận về:
+   - Principal: 9,900 USDC (chia theo deposit)
+   - Prize: 480 USDC (chia cho winners)
+```
+
+### Basis Points (BPS)
+
+```
+1 bps = 0.01%
+100 bps = 1%
+1000 bps = 10%
+10000 bps = 100%
+```
 
 ---
 
