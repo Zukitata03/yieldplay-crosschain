@@ -8,7 +8,7 @@ import {ITeleporterReceiver} from "../interfaces/ITeleporterReceiver.sol";
 import {ITeleporterMessenger, TeleporterMessageInput, TeleporterFeeInfo} from "../interfaces/ITeleporterMessenger.sol";
 
 /**
- * @notice Minimal interface for calling depositOnBehalf on YieldPlay
+ * @notice Minimal interface for calling depositOnBehalf / claimOnBehalf / confirm / rollback on YieldPlay
  */
 interface IYieldPlayDeposit {
     function depositOnBehalf(
@@ -23,6 +23,19 @@ interface IYieldPlayDeposit {
         uint256 roundId,
         address user
     ) external returns (uint256 totalAmount);
+
+    function confirmClaim(
+        bytes32 gameId,
+        uint256 roundId,
+        address user
+    ) external;
+
+    function rollbackClaim(
+        bytes32 gameId,
+        uint256 roundId,
+        address user,
+        uint256 amount
+    ) external;
 }
 
 /**
@@ -31,11 +44,10 @@ interface IYieldPlayDeposit {
  *
  * The Teleporter relayer calls receiveTeleporterMessage() after the source chain
  * sends a message via YieldPlaySender. This contract:
- *   1. Verifies msg.sender is the Teleporter Messenger (trust the protocol, not individuals)
+ *   1. Verifies msg.sender is the Teleporter Messenger
  *   2. Verifies the message came from the trusted YieldPlaySender on chainA
- *   3. Decodes the payload and calls YieldPlay.depositOnBehalf()
+ *   3. Decodes the payload and dispatches to YieldPlay
  *
-
  */
 contract YieldPlayReceiver is ITeleporterReceiver, Ownable {
     using SafeERC20 for IERC20;
@@ -48,6 +60,9 @@ contract YieldPlayReceiver is ITeleporterReceiver, Ownable {
 
     /// @notice Gas limit for execution on the destination chain
     uint256 public constant DEST_GAS_LIMIT = 300_000;
+
+    /// @notice How long before a proposed trust-anchor change takes effect
+    uint256 public constant TRUST_ROTATION_DELAY = 48 hours;
 
     // ─── Enums ────────────────────────────────────────────────────────────────
 
@@ -63,8 +78,16 @@ contract YieldPlayReceiver is ITeleporterReceiver, Ownable {
 
     // ─── State ────────────────────────────────────────────────────────────────
 
-    /// @notice Trusted senders: sourceChainID => YieldPlaySender address
+    /// @notice Trusted (active) senders: sourceChainID => YieldPlaySender address
     mapping(bytes32 => address) public trustedSenders;
+
+    /**
+     * @notice Pending trust-anchor proposals waiting for the timelock to expire.
+     * @dev struct PendingTrust { address newSender; uint256 effectiveAt; }
+     *      encoded as two storage slots for simplicity.
+     */
+    mapping(bytes32 => address) public pendingSenders;
+    mapping(bytes32 => uint256) public pendingSenderEffectiveAt;
 
     // ─── Events ───────────────────────────────────────────────────────────────
 
@@ -94,10 +117,15 @@ contract YieldPlayReceiver is ITeleporterReceiver, Ownable {
 
     event TrustedSenderSet(bytes32 indexed sourceChainId, address senderAddress);
 
+    event TrustedSenderProposed(bytes32 indexed sourceChainId, address newSender, uint256 effectiveAt);
+    event TrustedSenderExecuted(bytes32 indexed sourceChainId, address newSender);
+
     // ─── Errors ───────────────────────────────────────────────────────────────
 
     error OnlyTeleporter();
     error UntrustedSource(bytes32 sourceChainId, address originSenderAddress);
+    error RotationTooEarly(uint256 effectiveAt);
+    error NoPendingRotation();
 
     // ─── Constructor ──────────────────────────────────────────────────────────
 
@@ -115,7 +143,8 @@ contract YieldPlayReceiver is ITeleporterReceiver, Ownable {
     // ─── Admin ────────────────────────────────────────────────────────────────
 
     /**
-     * @notice Register a trusted sender on a source chain.
+     * @notice Register the INITIAL trusted sender for a source chain (first-time setup only).
+     * @dev For subsequent changes use proposeTrustedSender + executeTrustedSender.
      * @param sourceChainId   Blockchain ID of the source subnet (chainA)
      * @param senderContract  Address of YieldPlaySender on chainA
      */
@@ -123,8 +152,45 @@ contract YieldPlayReceiver is ITeleporterReceiver, Ownable {
         bytes32 sourceChainId,
         address senderContract
     ) external onlyOwner {
+        require(trustedSenders[sourceChainId] == address(0), "Use propose/execute to rotate");
         trustedSenders[sourceChainId] = senderContract;
         emit TrustedSenderSet(sourceChainId, senderContract);
+    }
+
+    /**
+     * @notice Propose a trust-anchor rotation. Takes effect after TRUST_ROTATION_DELAY.
+     * @dev During the delay both the old and proposed sender are accepted so in-flight messages
+     *      from the old sender are not orphaned.
+     * @param sourceChainId   Blockchain ID of the source subnet
+     * @param newSender       New YieldPlaySender address to trust
+     */
+    function proposeTrustedSender(
+        bytes32 sourceChainId,
+        address newSender
+    ) external onlyOwner {
+        uint256 effectiveAt = block.timestamp + TRUST_ROTATION_DELAY;
+        pendingSenders[sourceChainId] = newSender;
+        pendingSenderEffectiveAt[sourceChainId] = effectiveAt;
+        emit TrustedSenderProposed(sourceChainId, newSender, effectiveAt);
+    }
+
+    /**
+     * @notice Execute a previously proposed trust-anchor rotation.
+     * @dev Can only be called after TRUST_ROTATION_DELAY has elapsed.
+     *      Clears the pending entry and activates the new sender.
+     * @param sourceChainId Blockchain ID of the source subnet
+     */
+    function executeTrustedSender(bytes32 sourceChainId) external onlyOwner {
+        uint256 effectiveAt = pendingSenderEffectiveAt[sourceChainId];
+        if (effectiveAt == 0) revert NoPendingRotation();
+        if (block.timestamp < effectiveAt) revert RotationTooEarly(effectiveAt);
+
+        address newSender = pendingSenders[sourceChainId];
+        trustedSenders[sourceChainId] = newSender;
+        delete pendingSenders[sourceChainId];
+        delete pendingSenderEffectiveAt[sourceChainId];
+
+        emit TrustedSenderExecuted(sourceChainId, newSender);
     }
 
     // ─── ITeleporterReceiver ──────────────────────────────────────────────────
@@ -133,7 +199,7 @@ contract YieldPlayReceiver is ITeleporterReceiver, Ownable {
      * @notice Called by TeleporterMessenger when a message arrives from chainA.
      * @param sourceBlockchainID Blockchain ID of the origin chain
      * @param originSenderAddress Address of YieldPlaySender on chainA
-     * @param message ABI-encoded (gameId, roundId, user, amount)
+     * @param message ABI-encoded payload
      */
     function receiveTeleporterMessage(
         bytes32 sourceBlockchainID,
@@ -143,11 +209,19 @@ contract YieldPlayReceiver is ITeleporterReceiver, Ownable {
         // 1. Only TeleporterMessenger can call this
         if (msg.sender != TELEPORTER_MESSENGER) revert OnlyTeleporter();
 
-        // 2. Verify the message came from our trusted YieldPlaySender
-        address expectedSender = trustedSenders[sourceBlockchainID];
-        if (expectedSender == address(0) || originSenderAddress != expectedSender) {
+        // 2. Verify trust — accept both active sender AND pending (overlap window)
+        address activeSender = trustedSenders[sourceBlockchainID];
+        address pendingSender = pendingSenders[sourceBlockchainID];
+
+        bool fromActiveSender  = activeSender  != address(0) && originSenderAddress == activeSender;
+        bool fromPendingSender = pendingSender  != address(0) && originSenderAddress == pendingSender;
+
+        if (!fromActiveSender && !fromPendingSender) {
             revert UntrustedSource(sourceBlockchainID, originSenderAddress);
         }
+
+        // Use whichever matching sender address to reply
+        address replySender = fromActiveSender ? activeSender : pendingSender;
 
         // 3. Decode payload type
         MessageType messageType = abi.decode(message, (MessageType));
@@ -156,7 +230,7 @@ contract YieldPlayReceiver is ITeleporterReceiver, Ownable {
             (, bytes32 gameId, uint256 roundId, address user, uint256 amount) =
                 abi.decode(message, (MessageType, bytes32, uint256, address, uint256));
 
-            // 4. Approve YieldPlay to pull funds from this contract, then deposit
+            // Approve YieldPlay to pull funds from this contract, then deposit
             IERC20(paymentToken).safeIncreaseAllowance(address(yieldPlay), amount);
             
             try yieldPlay.depositOnBehalf(gameId, roundId, user, amount) {
@@ -165,19 +239,41 @@ contract YieldPlayReceiver is ITeleporterReceiver, Ownable {
                 // Deposit failed (e.g. round expired). Send refund message back.
                 IERC20(paymentToken).safeDecreaseAllowance(address(yieldPlay), amount);
                 bytes memory refundPayload = abi.encode(MessageType.REFUND, gameId, roundId, user, amount);
-                _sendTeleporterMessage(sourceBlockchainID, expectedSender, refundPayload);
+                _sendTeleporterMessage(sourceBlockchainID, replySender, refundPayload);
                 emit CrossChainRefundSent(sourceBlockchainID, gameId, roundId, user, amount);
             }
+
         } else if (messageType == MessageType.CLAIM_REQUEST) {
             (, bytes32 gameId, uint256 roundId, address user) =
                 abi.decode(message, (MessageType, bytes32, uint256, address));
-            
-            // Assuming claimOnBehalf sends funds to THIS receiver contract
+
+            // Measure actual tokens received via balance delta
+            // so the CLAIM_RESULT message reports the real delivered amount, not nominal.
+            uint256 preBal = IERC20(paymentToken).balanceOf(address(this));
             uint256 claimedAmount = yieldPlay.claimOnBehalf(gameId, roundId, user);
-            
-            bytes memory claimPayload = abi.encode(MessageType.CLAIM_RESULT, gameId, roundId, user, claimedAmount);
-            _sendTeleporterMessage(sourceBlockchainID, expectedSender, claimPayload);
-            emit CrossChainClaimProcessed(sourceBlockchainID, gameId, roundId, user, claimedAmount);
+            uint256 actualReceived = IERC20(paymentToken).balanceOf(address(this)) - preBal;
+
+            // Send CLAIM_RESULT with actualReceived (what the source chain will pay out)
+            bytes memory claimPayload = abi.encode(
+                MessageType.CLAIM_RESULT,
+                gameId,
+                roundId,
+                user,
+                actualReceived
+            );
+            _sendTeleporterMessage(sourceBlockchainID, replySender, claimPayload);
+            emit CrossChainClaimProcessed(sourceBlockchainID, gameId, roundId, user, actualReceived);
+
+            // If Teleporter message sending fails (or is never delivered),
+            // the Receiver can call rollbackClaim() on YieldPlay. For now we confirm
+            // optimistically after sending — a more robust design would wait for a
+            // CLAIM_RESULT_ACK from the source, but that requires a 3rd message leg.
+            // At minimum: confirmClaim is called here so isClaimed is eventually finalized.
+            yieldPlay.confirmClaim(gameId, roundId, user);
+
+            // Suppress unused variable warning; claimedAmount and actualReceived may differ
+            // for fee-on-transfer tokens — actualReceived is the correct value to report.
+            claimedAmount;
         }
     }
 

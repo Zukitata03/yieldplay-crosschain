@@ -80,4 +80,19 @@ library Errors {
 
     /// @notice Thrown when depositOnBehalf is called by an untrusted address
     error UnauthorizedCrossChainCaller();
+
+    /// @notice Thrown when a cross-chain claim is already in-flight for this user/round
+    error ClaimPending();
+
+    /// @notice Thrown when a CLAIM_RESULT amount exceeds what the user originally locked
+    error ExceedsLockedFunds();
+
+    /// @notice Thrown when the reclaim timeout has not yet elapsed
+    error TimeoutNotReached();
+
+    /// @notice Thrown when there is nothing to reclaim
+    error NothingToReclaim();
+
+    /// @notice Thrown when trying to rollback a claim that is not pending
+    error NoPendingClaim();
 }

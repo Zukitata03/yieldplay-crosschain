@@ -58,5 +58,6 @@ struct UserDeposit {
     uint256 depositAmount;   // User's total deposit
     uint256 amountToClaim;   // Prize winnings assigned
     bool isClaimed;          // Whether user has claimed
+    bool claimPending;       // True while a cross-chain claim is in-flight
     bool exists;             // Existence flag for mapping checks
 }

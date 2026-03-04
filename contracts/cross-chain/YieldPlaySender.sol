@@ -33,6 +33,9 @@ contract YieldPlaySender is ITeleporterReceiver {
     /// @notice Gas limit for execution on the destination chain
     uint256 public constant DEST_GAS_LIMIT = 300_000;
 
+    /// @notice How long before a depositor can unilaterally reclaim stuck funds
+    uint256 public constant RECLAIM_TIMEOUT = 7 days;
+
     // ─── Immutables ───────────────────────────────────────────────────────────
 
     /// @notice Blockchain ID of the destination chain (chainB), set at deploy time
@@ -50,8 +53,11 @@ contract YieldPlaySender is ITeleporterReceiver {
 
     // ─── State ────────────────────────────────────────────────────────────────
 
-    /// @notice Locked funds per user per game per round (for potential refund logic)
+    /// @notice Locked funds per user per game per round
     mapping(bytes32 => mapping(uint256 => mapping(address => uint256))) public lockedFunds;
+
+    /// @notice Timestamp of each deposit, used for timeout-based reclaim
+    mapping(bytes32 => mapping(uint256 => mapping(address => uint256))) public depositTimestamps;
 
     // ─── Events ───────────────────────────────────────────────────────────────
 
@@ -84,10 +90,19 @@ contract YieldPlaySender is ITeleporterReceiver {
         uint256 amount
     );
 
+    event DepositReclaimed(
+        bytes32 indexed gameId,
+        uint256 indexed roundId,
+        address indexed user,
+        uint256 amount
+    );
+
     // ─── Errors ───────────────────────────────────────────────────────────────
 
     error OnlyTeleporter();
     error UntrustedSource(bytes32 sourceChainId, address originSenderAddress);
+    error TimeoutNotReached();
+    error NothingToReclaim();
 
     // ─── Constructor ──────────────────────────────────────────────────────────
 
@@ -124,14 +139,19 @@ contract YieldPlaySender is ITeleporterReceiver {
     ) external returns (bytes32 teleporterMessageId) {
         require(amount > 0, "Amount must be > 0");
 
-        // 1. Lock tokens from user into this contract
+        // 1. Measure actual tokens received (handles fee-on-transfer tokens)
+        uint256 preBal = IERC20(sourceToken).balanceOf(address(this));
         IERC20(sourceToken).safeTransferFrom(msg.sender, address(this), amount);
-        lockedFunds[gameId][roundId][msg.sender] += amount;
+        uint256 actualAmount = IERC20(sourceToken).balanceOf(address(this)) - preBal;
 
-        // 2. Encode deposit intent as the message payload
-        bytes memory payload = abi.encode(MessageType.DEPOSIT, gameId, roundId, msg.sender, amount);
+        // 2. Lock actual tokens and record timestamp for timeout recovery
+        lockedFunds[gameId][roundId][msg.sender] += actualAmount;
+        depositTimestamps[gameId][roundId][msg.sender] = block.timestamp;
 
-        // 3. Send via Teleporter (fee = 0 for local relayer)
+        // 3. Encode deposit intent with actualAmount so the destination credits correctly
+        bytes memory payload = abi.encode(MessageType.DEPOSIT, gameId, roundId, msg.sender, actualAmount);
+
+        // 4. Send via Teleporter (fee = 0 for local relayer)
         TeleporterMessageInput memory messageInput = TeleporterMessageInput({
             destinationBlockchainID: destinationBlockchainID,
             destinationAddress: destinationReceiver,
@@ -144,7 +164,7 @@ contract YieldPlaySender is ITeleporterReceiver {
         teleporterMessageId = ITeleporterMessenger(TELEPORTER_MESSENGER)
             .sendCrossChainMessage(messageInput);
 
-        emit CrossChainDepositSent(gameId, roundId, msg.sender, amount, teleporterMessageId);
+        emit CrossChainDepositSent(gameId, roundId, msg.sender, actualAmount, teleporterMessageId);
     }
 
     /**
@@ -171,6 +191,27 @@ contract YieldPlaySender is ITeleporterReceiver {
         emit CrossChainClaimSent(gameId, roundId, msg.sender, teleporterMessageId);
     }
 
+    /**
+     * @notice Allow a user to reclaim their locked deposit if no REFUND or CLAIM_RESULT
+     *         has been received within RECLAIM_TIMEOUT.
+     * @param gameId  Game the deposit was for
+     * @param roundId Round the deposit was for
+     */
+    function reclaimTimedOut(bytes32 gameId, uint256 roundId) external {
+        uint256 locked = lockedFunds[gameId][roundId][msg.sender];
+        if (locked == 0) revert NothingToReclaim();
+        if (block.timestamp < depositTimestamps[gameId][roundId][msg.sender] + RECLAIM_TIMEOUT) {
+            revert TimeoutNotReached();
+        }
+
+        // Clear state before transfer (CEI pattern)
+        lockedFunds[gameId][roundId][msg.sender] = 0;
+        depositTimestamps[gameId][roundId][msg.sender] = 0;
+
+        IERC20(sourceToken).safeTransfer(msg.sender, locked);
+        emit DepositReclaimed(gameId, roundId, msg.sender, locked);
+    }
+
     // ─── ITeleporterReceiver ──────────────────────────────────────────────────
 
     /**
@@ -195,21 +236,32 @@ contract YieldPlaySender is ITeleporterReceiver {
         if (messageType == MessageType.CLAIM_RESULT) {
             (, bytes32 gameId, uint256 roundId, address user, uint256 amount) =
                 abi.decode(message, (MessageType, bytes32, uint256, address, uint256));
-            
-            // Unlock/transfer claimed tokens to user
-            if (amount > 0) {
-                IERC20(sourceToken).safeTransfer(user, amount);
+
+            // Cap payout to what the user actually locked (no collateral-bleed)
+            // and decrement locked funds before transfer (replay protection)
+            uint256 locked = lockedFunds[gameId][roundId][user];
+            uint256 payout = amount > locked ? locked : amount;
+
+            // Decrement BEFORE transfer (CEI pattern, replay protection)
+            lockedFunds[gameId][roundId][user] -= payout;
+
+            if (payout > 0) {
+                IERC20(sourceToken).safeTransfer(user, payout);
             }
-            emit ClaimReceived(gameId, roundId, user, amount);
-            
+            emit ClaimReceived(gameId, roundId, user, payout);
+
         } else if (messageType == MessageType.REFUND) {
             (, bytes32 gameId, uint256 roundId, address user, uint256 amount) =
                 abi.decode(message, (MessageType, bytes32, uint256, address, uint256));
-            
-            // Decrement locked funds and refund user
-            lockedFunds[gameId][roundId][user] -= amount;
-            IERC20(sourceToken).safeTransfer(user, amount);
-            emit RefundReceived(gameId, roundId, user, amount);
+
+            // Cap refund to locked balance to prevent over-refund from a malformed message
+            uint256 locked = lockedFunds[gameId][roundId][user];
+            uint256 refundAmount = amount > locked ? locked : amount;
+
+            // Decrement locked funds before transfer (CEI pattern)
+            lockedFunds[gameId][roundId][user] -= refundAmount;
+            IERC20(sourceToken).safeTransfer(user, refundAmount);
+            emit RefundReceived(gameId, roundId, user, refundAmount);
         }
     }
 }

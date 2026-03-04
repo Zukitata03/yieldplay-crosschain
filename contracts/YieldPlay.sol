@@ -50,12 +50,27 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
     /// @notice Mapping from gameId => roundId => deposited amount to vault
     mapping(bytes32 => mapping(uint256 => uint256)) public deployedAmounts;
     
-    /// @notice Mapping from gameId =\> roundId =\> vault shares received
+    /// @notice Mapping from gameId => roundId => vault shares received
     mapping(bytes32 => mapping(uint256 => uint256)) public deployedShares;
 
-    /// @notice Address of YieldPlayReceiver allowed to call depositOnBehalf
-    address public crossChainReceiver;
+    /// @notice Address of YieldPlayReceiver allowed to call depositOnBehalf / claimOnBehalf.
+ 
+    address public immutable crossChainReceiver;
 
+
+
+    /// @notice Per-round token reserves.  Tracks tokens actually held for each round so
+    ///         one round's shortfall cannot consume another round's principal.
+    /// @dev Keyed by gameId => roundId => reserved token balance
+    mapping(bytes32 => mapping(uint256 => uint256)) public roundReserves;
+
+
+
+    /// @notice Accrued protocol performance fees per token, redeemable by protocolTreasury.
+    mapping(address => uint256) public accruedProtocolFees;
+
+    /// @notice Accrued dev fees per game, redeemable by the game owner's treasury.
+    mapping(bytes32 => uint256) public accruedDevFees;
 
     // ============ Events ============
     
@@ -122,6 +137,21 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         uint256 principal,
         uint256 prize
     );
+
+    event ClaimConfirmed(
+        bytes32 indexed gameId,
+        uint256 indexed roundId,
+        address indexed user
+    );
+
+    event ClaimRolledBack(
+        bytes32 indexed gameId,
+        uint256 indexed roundId,
+        address indexed user
+    );
+
+    event ProtocolFeesWithdrawn(address indexed token, uint256 amount);
+    event DevFeesWithdrawn(bytes32 indexed gameId, uint256 amount);
     
     event VaultUpdated(address indexed token, address indexed vault);
     event ProtocolTreasuryUpdated(address indexed newTreasury);
@@ -130,11 +160,14 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
     
     /**
      * @notice Initialize the YieldPlay protocol
-     * @param _protocolTreasury Address to receive protocol performance fees
+     * @param _protocolTreasury  Address to receive protocol performance fees
+     * @param _crossChainReceiver Address of YieldPlayReceiver on this chain (immutable)
      */
-    constructor(address _protocolTreasury) Ownable(msg.sender) {
+    constructor(address _protocolTreasury, address _crossChainReceiver) Ownable(msg.sender) {
         if (_protocolTreasury == address(0)) revert Errors.ZeroAddress();
+        if (_crossChainReceiver == address(0)) revert Errors.ZeroAddress();
         protocolTreasury = _protocolTreasury;
+        crossChainReceiver = _crossChainReceiver;
     }
 
     // ============ Admin Functions ============
@@ -178,12 +211,40 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         _unpause();
     }
 
+    // ============ Pull-based fee withdrawal ============
+
     /**
-     * @notice Set the address of the trusted cross-chain receiver contract.
-     * @param _receiver Address of YieldPlayReceiver deployed on this chain
+     * @notice Withdraw accrued protocol performance fees for a given token.
+     * @dev Only callable by anyone — sends to protocolTreasury directly.
+     *      Pull-based model removes the DoS vector from settlement().
+     * @param token The payment token whose fees to withdraw
      */
-    function setCrossChainReceiver(address _receiver) external onlyOwner {
-        crossChainReceiver = _receiver;
+    function withdrawProtocolFees(address token) external nonReentrant {
+        uint256 amount = accruedProtocolFees[token];
+        if (amount == 0) revert Errors.InvalidAmount();
+        accruedProtocolFees[token] = 0;
+        IERC20(token).safeTransfer(protocolTreasury, amount);
+        emit ProtocolFeesWithdrawn(token, amount);
+    }
+
+    /**
+     * @notice Withdraw accrued dev fees for a game.
+     * @dev Only callable by the game owner. Pull-based to avoid settlement DoS.
+     * @param gameId The game whose dev fees to withdraw
+     */
+    function withdrawDevFees(bytes32 gameId) external nonReentrant {
+        Game storage game = games[gameId];
+        if (!game.initialized) revert Errors.GameNotFound();
+        if (msg.sender != game.owner) revert Errors.Unauthorized();
+
+        uint256 amount = accruedDevFees[gameId];
+        if (amount == 0) revert Errors.InvalidAmount();
+
+        // Determine token from the most recent round
+        address token = _latestPaymentToken(gameId, game.roundCounter);
+        accruedDevFees[gameId] = 0;
+        IERC20(token).safeTransfer(game.treasury, amount);
+        emit DevFeesWithdrawn(gameId, amount);
     }
 
     /**
@@ -193,7 +254,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
      * @param gameId  Target game
      * @param roundId Target round
      * @param user    Original depositor address on the source chain
-     * @param amount  Amount of tokens to credit (already transferred here)
+     * @param amount  Nominal amount (actual received is measured via balance delta)
      */
     function depositOnBehalf(
         bytes32 gameId,
@@ -212,21 +273,79 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         updateRoundStatus(gameId, roundId);
         if (round.status != RoundStatus.InProgress) revert Errors.RoundNotActive();
 
-        // Pull tokens from Receiver into YieldPlay 
+        // Measure actual tokens received (handles fee-on-transfer tokens)
+        uint256 preBal = IERC20(round.paymentToken).balanceOf(address(this));
         IERC20(round.paymentToken).safeTransferFrom(msg.sender, address(this), amount);
+        uint256 actualAmount = IERC20(round.paymentToken).balanceOf(address(this)) - preBal;
 
         // Calculate deposit fee (goes to bonus prize pool)
-        uint256 depositFee = (amount * round.depositFeeBps) / BPS_DENOMINATOR;
-        uint256 netDeposit = amount - depositFee;
+        uint256 depositFee = (actualAmount * round.depositFeeBps) / BPS_DENOMINATOR;
+        uint256 netDeposit = actualAmount - depositFee;
 
         round.totalDeposit += netDeposit;
         round.bonusPrizePool += depositFee;
+
+        // Track per-round reserves
+        roundReserves[gameId][roundId] += actualAmount;
 
         UserDeposit storage userDep = userDeposits[gameId][roundId][user];
         userDep.depositAmount += netDeposit;
         userDep.exists = true;
 
         emit Deposited(gameId, roundId, user, netDeposit, depositFee);
+    }
+
+    // ============ Two-phase cross-chain claim confirmation ============
+
+    /**
+     * @notice Called by YieldPlayReceiver to confirm that the source-chain payout
+     *         succeeded. Transitions claimPending -> isClaimed.
+     * @param gameId  Game of the claim
+     * @param roundId Round of the claim
+     * @param user    Claimer address
+     */
+    function confirmClaim(
+        bytes32 gameId,
+        uint256 roundId,
+        address user
+    ) external nonReentrant whenNotPaused {
+        if (msg.sender != crossChainReceiver) revert Errors.UnauthorizedCrossChainCaller();
+        UserDeposit storage userDep = userDeposits[gameId][roundId][user];
+        if (!userDep.claimPending) revert Errors.NoPendingClaim();
+        userDep.claimPending = false;
+        userDep.isClaimed = true;
+        emit ClaimConfirmed(gameId, roundId, user);
+    }
+
+    /**
+     * @notice Called by YieldPlayReceiver to roll back a pending claim if the
+     *         source-chain payout fails. Clears claimPending and returns funds.
+     * @dev The Receiver holds the tokens between claimOnBehalf() and this call.
+     *      Tokens are returned to this contract via safeTransferFrom.
+     * @param gameId  Game of the claim
+     * @param roundId Round of the claim
+     * @param user    Claimer address
+     * @param amount  Amount to return (must match what was transferred to Receiver)
+     */
+    function rollbackClaim(
+        bytes32 gameId,
+        uint256 roundId,
+        address user,
+        uint256 amount
+    ) external nonReentrant whenNotPaused {
+        if (msg.sender != crossChainReceiver) revert Errors.UnauthorizedCrossChainCaller();
+        UserDeposit storage userDep = userDeposits[gameId][roundId][user];
+        if (!userDep.claimPending) revert Errors.NoPendingClaim();
+
+        // Receiver returns the tokens here
+        IERC20(rounds[gameId][roundId].paymentToken).safeTransferFrom(
+            msg.sender, address(this), amount
+        );
+
+        userDep.claimPending = false;
+        // isClaimed stays false — user can retry
+        roundReserves[gameId][roundId] += amount;
+        emit ClaimRolledBack(gameId, roundId, user);
     }
 
 
@@ -369,7 +488,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         updateRoundStatus(gameId, roundId);
         if (round.status != RoundStatus.InProgress) revert Errors.RoundNotActive();
         
-        // Transfer tokens from user
+        // Transfer tokens from user (balance-delta for fee-on-transfer safety)
         uint256 preBalance = IERC20(round.paymentToken).balanceOf(address(this));
         IERC20(round.paymentToken).safeTransferFrom(msg.sender, address(this), amount);
         uint256 postBalance = IERC20(round.paymentToken).balanceOf(address(this));
@@ -382,6 +501,9 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         // Update round state
         round.totalDeposit += netDeposit;
         round.bonusPrizePool += depositFee;
+
+        // Track per-round reserves
+        roundReserves[gameId][roundId] += actualAmount;
         
         // Update user state (user gets credit for net deposit)
         UserDeposit storage userDep = userDeposits[gameId][roundId][msg.sender];
@@ -406,14 +528,19 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         if (round.status != RoundStatus.DistributingRewards) {
             revert Errors.RoundNotCompleted();
         }
-        if (userDep.isClaimed) revert Errors.AlreadyClaimed();
+        if (userDep.isClaimed || userDep.claimPending) revert Errors.AlreadyClaimed();
         if (!userDep.exists || userDep.depositAmount == 0) {
             revert Errors.NoDepositsFound();
         }
         
         uint256 totalAmount = userDep.depositAmount + userDep.amountToClaim;
+
+        // Verify per-round solvency before transfer
+        if (totalAmount > roundReserves[gameId][roundId]) revert Errors.InvalidAmount();
         
+        // CEI: update state before transfer
         userDep.isClaimed = true;
+        roundReserves[gameId][roundId] -= totalAmount;
         
         if (totalAmount > 0) {
             IERC20(round.paymentToken).safeTransfer(msg.sender, totalAmount);
@@ -421,13 +548,12 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         
         emit Claimed(gameId, roundId, msg.sender, userDep.depositAmount, userDep.amountToClaim);
     }
-
     /**
-     * @notice Cross-chain claims for users from another chain
+     * @notice Cross-chain claims for users from another chain.
      * @param gameId The game identifier
      * @param roundId The round identifier
      * @param user The original depositor's address
-     * @return totalAmount The amount claimed and transferred
+     * @return totalAmount The amount transferred to the Receiver for cross-chain payout
      */
     function claimOnBehalf(
         bytes32 gameId,
@@ -442,21 +568,27 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         if (round.status != RoundStatus.DistributingRewards) {
             revert Errors.RoundNotCompleted();
         }
-        if (userDep.isClaimed) revert Errors.AlreadyClaimed();
+        // Block if claim is already finalized OR still in-flight
+        if (userDep.isClaimed || userDep.claimPending) revert Errors.AlreadyClaimed();
         if (!userDep.exists || userDep.depositAmount == 0) {
             revert Errors.NoDepositsFound();
         }
         
         totalAmount = userDep.depositAmount + userDep.amountToClaim;
-        userDep.isClaimed = true;
+
+        // Verify per-round solvency
+        if (totalAmount > roundReserves[gameId][roundId]) revert Errors.InvalidAmount();
+
+        // Mark as pending (NOT finalized) until source-chain confirms
+        userDep.claimPending = true;
+        roundReserves[gameId][roundId] -= totalAmount;
         
         if (totalAmount > 0) {
+            // Transfer to Receiver, which holds funds until CLAIM_RESULT is ACKed
             IERC20(round.paymentToken).safeTransfer(msg.sender, totalAmount);
         }
         
         emit Claimed(gameId, roundId, user, userDep.depositAmount, userDep.amountToClaim);
-        
-        return totalAmount;
     }
 
     // ============ Game Owner Actions ============
@@ -500,7 +632,6 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         IERC20(round.paymentToken).safeIncreaseAllowance(round.vault, amount);
         uint256 shares = IERC4626(round.vault).deposit(amount, address(this));
         
-        
         deployedShares[gameId][roundId] += shares;
 
         emit FundsDeployed(gameId, roundId, amount, shares);
@@ -528,7 +659,14 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         if (round.isWithdrawn) revert Errors.FundsAlreadyWithdrawn();
         
         uint256 shares = deployedShares[gameId][roundId];
-        if (shares == 0) revert Errors.FundsNotDeployed();
+
+        // Zero-shares escape path — nothing was deployed, allow settlement to proceed
+        if (shares == 0) {
+            round.isWithdrawn = true;
+            emit FundsWithdrawn(gameId, roundId, 0, 0);
+            return;
+        }
+
         if (round.vault == address(0)) revert Errors.StrategyNotSet();
         
         uint256 principal = deployedAmounts[gameId][roundId];
@@ -541,12 +679,15 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         round.yieldAmount = yieldAmount;
         round.isWithdrawn = true;
         deployedShares[gameId][roundId] = 0;
+
+        // Restore per-round reserves with the withdrawn amount
+        roundReserves[gameId][roundId] += withdrawn;
         
         emit FundsWithdrawn(gameId, roundId, principal, yieldAmount);
     }
     
     /**
-     * @notice Settle the round - calculate and distribute fees
+     * @notice Settle the round — calculate fees (accrued, not pushed).
      * @param gameId The game identifier
      * @param roundId The round identifier
      */
@@ -582,13 +723,16 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
             // Calculate dev fee on remaining yield
             devFee = (afterPerformance * game.devFeeBps) / BPS_DENOMINATOR;
             yieldPrize = afterPerformance - devFee;
-            
-            // Transfer fees
+
+            // Accrue fees (pull-based) instead of pushing to treasury addresses
             if (performanceFee > 0) {
-                IERC20(round.paymentToken).safeTransfer(protocolTreasury, performanceFee);
+                accruedProtocolFees[round.paymentToken] += performanceFee;
+                // Remove fee amount from per-round reserves
+                roundReserves[gameId][roundId] -= performanceFee;
             }
             if (devFee > 0) {
-                IERC20(round.paymentToken).safeTransfer(game.treasury, devFee);
+                accruedDevFees[gameId] += devFee;
+                roundReserves[gameId][roundId] -= devFee;
             }
         }
         
@@ -642,6 +786,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
     
     /**
      * @notice Finalize round and allow claims (if prizes not fully allocated)
+
      * @param gameId The game identifier
      * @param roundId The round identifier
      */
@@ -659,12 +804,15 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         if (!round.isSettled) revert Errors.RoundNotSettled();
 
         if (round.totalWin > 0) {
-            IERC20(round.paymentToken).safeTransfer(game.treasury, round.totalWin);
+            uint256 remaining = round.totalWin;
+            // Update state BEFORE external call (Checks-Effects-Interactions)
             round.totalWin = 0;
+            roundReserves[gameId][roundId] -= remaining;
+            // Return remaining unallocated prize to game treasury
+            IERC20(round.paymentToken).safeTransfer(game.treasury, remaining);
         }
         
         // Allow finalization even if not all prizes distributed
-        // Remaining goes back to depositors proportionally or stays for next round
         round.status = RoundStatus.DistributingRewards;
     }
 
@@ -744,5 +892,16 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         } else {
             return RoundStatus.ChoosingWinners;
         }
+    }
+
+    // ============ Internal Helpers ============
+
+    /**
+     * @dev Returns the payment token of the most recently created round for a game.
+     *      Used by withdrawDevFees to determine which token to transfer.
+     */
+    function _latestPaymentToken(bytes32 gameId, uint256 roundCounter) internal view returns (address) {
+        if (roundCounter == 0) revert Errors.RoundNotFound();
+        return rounds[gameId][roundCounter - 1].paymentToken;
     }
 }
